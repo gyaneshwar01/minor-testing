@@ -1,0 +1,64 @@
+# ============== Python ==============
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============== Virtual Environments ==============
+.venv/
+venv/
+env/
+ENV/
+
+# ============== Jupyter Notebooks ==============
+.ipynb_checkpoints/
+
+# ============== Dataset & Audio Files ==============
+Dataset/
+/data/
+
+# ============== Trained Models / Checkpoints ==============
+models/
+checkpoints/
+runs/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# ============== Logs & Metrics ==============
+logs/
+*.log
+wandb/
+mlruns/
+tensorboard/
+
+# ============== IDE / Editor ==============
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+
+# ============== OS Files ==============
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============== Misc ==============
+*.zip
+*.tar.gz
+*.rar
+.env
+.env.*
