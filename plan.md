@@ -108,13 +108,13 @@ python -m src.data.clean_transcripts
 python -m src.data.prepare_dataset
 ```
 
-### Phase 2: Model Training -- CODE WRITTEN, NOT YET RUN ⏳
+### Phase 2: Model Training -- DONE ✅
 
 | Task                       | Status       | File                          | Notes                                  |
 |----------------------------|--------------|-------------------------------|----------------------------------------|
 | Training config (QLoRA)    | DONE         | `src/training/config.py`      | 4-bit NF4 + LoRA + 8-bit optimizer     |
 | Training script            | DONE         | `src/training/train.py`       | Whisper Medium + QLoRA via PEFT        |
-| Training notebook          | DONE         | `notebooks/02_training.ipynb` | Self-contained, 6 GB GPU ready         |
+| Training notebook          | DONE         | `notebooks/02_training.ipynb` | Completed; test WER = 24.51%           |
 
 **Model:** `openai/whisper-medium` (769M params) with QLoRA:
 - Base model quantized to 4-bit NF4 (~1.5 GB VRAM)
@@ -156,7 +156,7 @@ python -m src.training.train
 - QLoRA: same quality as full fine-tuning per the QLoRA paper, ~60% less memory
 - 8-bit paged AdamW further reduces optimizer state memory
 
-### Phase 3: Evaluation -- CODE WRITTEN, NOT YET RUN ⏳
+### Phase 3: Evaluation -- DONE ✅
 
 | Task                       | Status       | File                              | Notes                              |
 |----------------------------|--------------|-----------------------------------|------------------------------------|
@@ -187,7 +187,7 @@ python -m src.evaluation.analyze_results \
 4. **Nepali-only WER** -- WER on pure-Nepali subset
 5. **English Token Precision / Recall / F1** -- accuracy on English words
 
-### Phase 4: Demo -- CODE WRITTEN, NOT YET RUN ⏳
+### Phase 4: Demo -- RUNNING ✅
 
 | Task                       | Status       | File                    | Notes                                 |
 |----------------------------|--------------|-------------------------|---------------------------------------|

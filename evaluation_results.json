@@ -1,0 +1,16 @@
+{
+  "label": "fine-tuned",
+  "num_samples": 680,
+  "wer": 26.23,
+  "cer": 11.0,
+  "cs_wer": 26.85,
+  "cs_count": 215,
+  "nepali_only_wer": 25.85,
+  "nepali_only_count": 465,
+  "eng_token_precision": 87.18,
+  "eng_token_recall": 82.52,
+  "eng_token_f1": 84.79,
+  "total_ref_english_tokens": 412,
+  "total_pred_english_tokens": 390,
+  "correctly_predicted_tokens": 340
+}

@@ -27,13 +27,19 @@ Dataset/
 /data/
 
 # ============== Trained Models / Checkpoints ==============
-models/
+# Ignore everything inside models/ except the final LoRA adapter (~31 MB)
+models/*
+!models/whisper-neplish/
+models/whisper-neplish/*
+!models/whisper-neplish/final/
 checkpoints/
 runs/
 *.pt
 *.pth
-*.bin
-*.safetensors
+# Allow specific files in the final adapter directory
+!models/whisper-neplish/final/*.json
+!models/whisper-neplish/final/*.safetensors
+!models/whisper-neplish/final/*.md
 *.onnx
 
 # ============== Logs & Metrics ==============

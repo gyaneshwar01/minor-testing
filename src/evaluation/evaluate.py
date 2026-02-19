@@ -87,7 +87,7 @@ def transcribe_batch(
         sampling_rate=sampling_rate,
         return_tensors="pt",
         padding=True,
-    ).input_features.to(device)
+    ).input_features.to(device=device, dtype=model.dtype)
 
     forced_decoder_ids = processor.get_decoder_prompt_ids(
         language=language, task="transcribe"

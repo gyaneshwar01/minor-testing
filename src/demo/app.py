@@ -123,7 +123,7 @@ def transcribe(audio_input, model, processor) -> str:
 
     input_features = processor.feature_extractor(
         audio_array, sampling_rate=16000, return_tensors="pt"
-    ).input_features.to(device)
+    ).input_features.to(device=device, dtype=model.dtype)
 
     forced_decoder_ids = processor.get_decoder_prompt_ids(
         language="ne", task="transcribe"
@@ -152,36 +152,76 @@ def highlight_english(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def transcribe_finetuned(audio):
-    """Transcribe using the fine-tuned model."""
+    """Transcribe using the fine-tuned model (generator for live progress)."""
+    if audio is None:
+        yield "No audio provided."
+        return
+
+    if _finetuned_model is None:
+        yield "⏳ Loading fine-tuned model (first run only, ~30s)..."
+    else:
+        yield "🎙️ Transcribing..."
     model, processor = load_finetuned()
-    return transcribe(audio, model, processor)
+
+    yield "🎙️ Transcribing audio..."
+    text = transcribe(audio, model, processor)
+    yield highlight_english(text)
 
 
 def transcribe_vanilla(audio):
-    """Transcribe using vanilla Whisper."""
+    """Transcribe using vanilla Whisper (generator for live progress)."""
+    if audio is None:
+        yield "No audio provided."
+        return
+
+    if _vanilla_model is None:
+        yield "⏳ Loading vanilla Whisper (first run only, ~30s)..."
+    else:
+        yield "🎙️ Transcribing..."
     model, processor = load_vanilla()
-    return transcribe(audio, model, processor)
+
+    yield "🎙️ Transcribing audio..."
+    text = transcribe(audio, model, processor)
+    yield highlight_english(text)
 
 
 def transcribe_both(audio):
-    """Transcribe with both models and return side-by-side results."""
+    """Transcribe with both models and return side-by-side results (generator for live progress)."""
+    if audio is None:
+        yield "No audio provided.", "No audio provided."
+        return
+
+    # Step 1: Load fine-tuned model
+    if _finetuned_model is None:
+        yield "⏳ Loading fine-tuned model...", "⏳ Waiting..."
+    else:
+        yield "🎙️ Preparing...", "⏳ Waiting..."
     ft_model, ft_proc = load_finetuned()
+
+    # Step 2: Load vanilla model
+    if _vanilla_model is None:
+        yield "⏳ Loading vanilla Whisper...", "✅ Fine-tuned model ready"
+    else:
+        yield "🎙️ Preparing...", "✅ Fine-tuned model ready"
     van_model, van_proc = load_vanilla()
 
+    # Step 3: Transcribe with fine-tuned
+    yield "⏳ Waiting...", "🎙️ Transcribing (fine-tuned)..."
     ft_text = transcribe(audio, ft_model, ft_proc)
-    van_text = transcribe(audio, van_model, van_proc)
-
     ft_highlighted = highlight_english(ft_text)
+
+    # Step 4: Transcribe with vanilla
+    yield "🎙️ Transcribing (baseline)...", ft_highlighted
+    van_text = transcribe(audio, van_model, van_proc)
     van_highlighted = highlight_english(van_text)
 
-    return van_highlighted, ft_highlighted
+    yield van_highlighted, ft_highlighted
 
 
 def build_demo() -> gr.Blocks:
     """Build the Gradio Blocks UI."""
     with gr.Blocks(
         title="Neplish ASR",
-        theme=gr.themes.Soft(),
     ) as demo:
         gr.Markdown(
             """
@@ -277,7 +317,7 @@ def main():
     args = parser.parse_args()
 
     demo = build_demo()
-    demo.launch(share=args.share, server_port=args.port)
+    demo.launch(share=args.share, server_port=args.port, theme=gr.themes.Soft())
 
 
 if __name__ == "__main__":

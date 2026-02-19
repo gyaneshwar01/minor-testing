@@ -1,0 +1,16 @@
+{
+  "label": "baseline (openai/whisper-medium)",
+  "num_samples": 680,
+  "wer": 101.56,
+  "cer": 44.08,
+  "cs_wer": 98.19,
+  "cs_count": 215,
+  "nepali_only_wer": 103.63,
+  "nepali_only_count": 465,
+  "eng_token_precision": 73.58,
+  "eng_token_recall": 9.47,
+  "eng_token_f1": 16.77,
+  "total_ref_english_tokens": 412,
+  "total_pred_english_tokens": 53,
+  "correctly_predicted_tokens": 39
+}
