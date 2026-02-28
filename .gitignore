@@ -23,6 +23,7 @@ ENV/
 .ipynb_checkpoints/
 
 # ============== Dataset & Audio Files ==============
+hf_dataset-20260228T151518Z-1-001/
 Dataset/
 /data/
 

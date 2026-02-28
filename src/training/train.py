@@ -223,8 +223,22 @@ def train(config: NeplishASRConfig | None = None) -> None:
     # ------------------------------------------------------------------
     # 4. Load and preprocess dataset
     # ------------------------------------------------------------------
-    logger.info("Loading dataset from %s", config.data.hf_dataset_dir)
-    dataset = load_from_disk(config.data.hf_dataset_dir)
+    if config.data.use_augmented:
+        dataset_dir = config.data.hf_augmented_dataset_dir
+        logger.info("Using AUGMENTED dataset from %s", dataset_dir)
+    else:
+        dataset_dir = config.data.hf_dataset_dir
+        logger.info("Using original dataset from %s", dataset_dir)
+
+    if not os.path.exists(dataset_dir):
+        # Fall back to original dataset if augmented doesn't exist
+        dataset_dir = config.data.hf_dataset_dir
+        logger.warning(
+            "Augmented dataset not found. Falling back to original: %s",
+            dataset_dir,
+        )
+
+    dataset = load_from_disk(dataset_dir)
 
     logger.info("Preprocessing dataset (extracting features + tokenising) ...")
     prep_fn = partial(
