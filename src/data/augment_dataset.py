@@ -275,16 +275,22 @@ def augment_audio(
 
     if augment_type is None:
         # 50% chance of single augmentation, 50% chance of combo
-        if rng.random() < 0.5:
-            augment_type = rng.choice(available_augmentations)
-        else:
+        # (combo requires at least 2 augmentation types available)
+        if len(available_augmentations) >= 2 and rng.random() < 0.5:
             augment_type = "combo"
+        else:
+            augment_type = rng.choice(available_augmentations)
 
     augmented = audio.copy()
 
     if augment_type == "combo":
         # Apply 2-3 random augmentations in sequence
-        n_augs = rng.integers(2, min(4, len(available_augmentations) + 1))
+        max_combo = min(4, len(available_augmentations) + 1)
+        if max_combo <= 2:
+            n_augs = 2
+        else:
+            n_augs = rng.integers(2, max_combo)
+        n_augs = min(n_augs, len(available_augmentations))  # safety cap
         chosen = rng.choice(available_augmentations, size=n_augs, replace=False)
         for aug in chosen:
             augmented = _apply_single_augmentation(augmented, sr, rng, config, aug)
@@ -338,6 +344,20 @@ def augment_single_example(
     audio_array = example["audio"]["array"]
     sr = example["audio"]["sampling_rate"]
 
+    # Guard: skip augmentation for empty or near-silent audio
+    if audio_array is None or len(audio_array) == 0:
+        return {
+            "audio": {
+                "array": audio_array if audio_array is not None else np.array([], dtype=np.float32),
+                "sampling_rate": sr,
+                "path": example["audio"].get("path", ""),
+            },
+            "sentence": example["sentence"],
+        }
+
+    # Ensure float32
+    audio_array = audio_array.astype(np.float32)
+
     augmented_audio = augment_audio(audio_array, sr, rng, config, augment_type)
 
     return {
@@ -350,12 +370,47 @@ def augment_single_example(
     }
 
 
+def _make_augment_fn(seed: int, config: AugmentationConfig, augment_type: Optional[str] = None):
+    """Return a stateless map function with its own RNG seeded per-index.
+
+    Using the example index to seed ensures reproducibility *and* avoids
+    sharing mutable RNG state across workers.
+    """
+    def _augment_map(example, idx):
+        # Per-example RNG so the function is stateless & safe for num_proc>1
+        rng = np.random.default_rng(seed + idx)
+        audio_array = example["audio"]["array"]
+        sr = example["audio"]["sampling_rate"]
+
+        if audio_array is None or len(audio_array) == 0:
+            return example
+
+        audio_array = audio_array.astype(np.float32)
+        try:
+            augmented = augment_audio(audio_array, sr, rng, config, augment_type)
+        except Exception:
+            augmented = audio_array
+
+        example["audio"] = {
+            "array": augmented,
+            "sampling_rate": sr,
+            "path": example["audio"].get("path", ""),
+        }
+        return example
+
+    return _augment_map
+
+
 def augment_dataset(
     dataset: Dataset,
     config: AugmentationConfig,
     split_name: str = "train",
+    tmp_dir: Optional[str] = None,
 ) -> Dataset:
     """Create augmented copies of a dataset split.
+
+    Uses ``Dataset.map()`` so that augmented audio is written to
+    memory-mapped Arrow files instead of being held in RAM.
 
     Steps:
       1. Separate into pure-Nepali and code-switched subsets.
@@ -370,13 +425,21 @@ def augment_dataset(
         Augmentation settings.
     split_name : str
         Name of the split (for logging).
+    tmp_dir : str, optional
+        Directory for intermediate Arrow caches (defaults to system temp).
 
     Returns
     -------
     Dataset
         Augmented dataset (original + augmented copies).
     """
-    rng = np.random.default_rng(config.seed)
+    import gc
+    import tempfile
+
+    if tmp_dir is None:
+        tmp_dir = os.path.join(tempfile.gettempdir(), "neplish_aug_cache")
+    os.makedirs(tmp_dir, exist_ok=True)
+
     sentences = dataset["sentence"]
 
     # Identify subsets
@@ -388,7 +451,32 @@ def augment_dataset(
         split_name, len(nepali_indices), len(cs_indices),
     )
 
-    all_augmented = []
+    saved_paths: list[str] = []  # paths to saved augmented splits
+
+    def _map_and_save(subset: Dataset, label: str, copy_idx: int, seed_offset: int) -> None:
+        """Map augmentation over *subset*, save to disk, release memory."""
+        aug_seed = config.seed + seed_offset
+        aug_fn = _make_augment_fn(aug_seed, config)
+
+        aug_ds = subset.map(
+            aug_fn,
+            with_indices=True,
+            keep_in_memory=False,
+            desc=f"{label} copy {copy_idx + 1}",
+        )
+
+        save_path = os.path.join(tmp_dir, f"{label}_{copy_idx}")
+        aug_ds.save_to_disk(save_path)
+        saved_paths.append(save_path)
+
+        logger.info(
+            "[%s] %s augmented copy %d saved (%d samples)",
+            split_name, label, copy_idx + 1, len(aug_ds),
+        )
+        del aug_ds
+        gc.collect()
+
+    seed_offset = 0
 
     # --- Augment pure-Nepali samples ---
     nepali_factor = config.nepali_augment_factor
@@ -399,22 +487,10 @@ def augment_dataset(
             split_name, nepali_factor, len(nepali_subset),
         )
         for copy_idx in range(nepali_factor):
-            aug_data = {"audio": [], "sentence": []}
-            for i in range(len(nepali_subset)):
-                example = nepali_subset[i]
-                aug_example = augment_single_example(
-                    example, rng, config, augment_type=None
-                )
-                aug_data["audio"].append(aug_example["audio"])
-                aug_data["sentence"].append(aug_example["sentence"])
-
-            aug_ds = Dataset.from_dict(aug_data)
-            aug_ds = aug_ds.cast_column("audio", Audio(sampling_rate=config.sampling_rate))
-            all_augmented.append(aug_ds)
-            logger.info(
-                "[%s] Pure-Nepali augmented copy %d/%d done (%d samples)",
-                split_name, copy_idx + 1, nepali_factor, len(aug_ds),
-            )
+            _map_and_save(nepali_subset, "nepali", copy_idx, seed_offset)
+            seed_offset += len(nepali_subset)
+        del nepali_subset
+        gc.collect()
 
     # --- Augment code-switched (English) samples ---
     english_factor = config.english_augment_factor
@@ -425,22 +501,10 @@ def augment_dataset(
             split_name, english_factor, len(cs_subset),
         )
         for copy_idx in range(english_factor):
-            aug_data = {"audio": [], "sentence": []}
-            for i in range(len(cs_subset)):
-                example = cs_subset[i]
-                aug_example = augment_single_example(
-                    example, rng, config, augment_type=None
-                )
-                aug_data["audio"].append(aug_example["audio"])
-                aug_data["sentence"].append(aug_example["sentence"])
-
-            aug_ds = Dataset.from_dict(aug_data)
-            aug_ds = aug_ds.cast_column("audio", Audio(sampling_rate=config.sampling_rate))
-            all_augmented.append(aug_ds)
-            logger.info(
-                "[%s] Code-switched augmented copy %d/%d done (%d samples)",
-                split_name, copy_idx + 1, english_factor, len(aug_ds),
-            )
+            _map_and_save(cs_subset, "codeswitched", copy_idx, seed_offset)
+            seed_offset += len(cs_subset)
+        del cs_subset
+        gc.collect()
 
     # --- General augmentation of all samples ---
     general_factor = config.augment_factor
@@ -450,32 +514,27 @@ def augment_dataset(
             split_name, general_factor, len(dataset),
         )
         for copy_idx in range(general_factor):
-            aug_data = {"audio": [], "sentence": []}
-            for i in range(len(dataset)):
-                example = dataset[i]
-                aug_example = augment_single_example(
-                    example, rng, config, augment_type=None
-                )
-                aug_data["audio"].append(aug_example["audio"])
-                aug_data["sentence"].append(aug_example["sentence"])
+            _map_and_save(dataset, "general", copy_idx, seed_offset)
+            seed_offset += len(dataset)
+        gc.collect()
 
-            aug_ds = Dataset.from_dict(aug_data)
-            aug_ds = aug_ds.cast_column("audio", Audio(sampling_rate=config.sampling_rate))
-            all_augmented.append(aug_ds)
-            logger.info(
-                "[%s] General augmented copy %d/%d done (%d samples)",
-                split_name, copy_idx + 1, general_factor, len(aug_ds),
-            )
-
-    # Concatenate original + all augmented
-    if all_augmented:
-        final_dataset = concatenate_datasets([dataset] + all_augmented)
+    # --- Concatenate original + all augmented from disk ---
+    if saved_paths:
+        logger.info("[%s] Loading %d augmented splits from disk ...", split_name, len(saved_paths))
+        augmented_parts = [load_from_disk(p) for p in saved_paths]
+        final_dataset = concatenate_datasets([dataset] + augmented_parts)
         final_dataset = final_dataset.shuffle(seed=config.seed)
         logger.info(
             "[%s] Final dataset: %d samples (original: %d, augmented: %d)",
             split_name, len(final_dataset), len(dataset),
             len(final_dataset) - len(dataset),
         )
+        # Cleanup temp files
+        import shutil
+        for p in saved_paths:
+            shutil.rmtree(p, ignore_errors=True)
+        del augmented_parts
+        gc.collect()
     else:
         final_dataset = dataset
         logger.info("[%s] No augmentation applied.", split_name)

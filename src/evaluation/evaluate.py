@@ -39,7 +39,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # Inference helpers
 # ---------------------------------------------------------------------------
 
-def load_model(model_dir: str, base_model_name: str = "openai/whisper-medium"):
+def load_model(model_dir: str, base_model_name: str = "openai/whisper-large-v3"):
     """Load a fine-tuned QLoRA Whisper model.
 
     The base model is loaded in fp16 (not quantized) and the LoRA
@@ -61,7 +61,7 @@ def load_model(model_dir: str, base_model_name: str = "openai/whisper-medium"):
     return model, processor, device
 
 
-def load_vanilla_model(model_name: str = "openai/whisper-medium"):
+def load_vanilla_model(model_name: str = "openai/whisper-large-v3"):
     """Load vanilla (non-fine-tuned) Whisper for baseline comparison."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     processor = WhisperProcessor.from_pretrained(model_name, language="ne", task="transcribe")

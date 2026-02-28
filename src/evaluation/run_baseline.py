@@ -28,7 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 def main():
     parser = argparse.ArgumentParser(description="Run vanilla Whisper baseline evaluation.")
     parser.add_argument(
-        "--model", type=str, default="openai/whisper-medium",
+        "--model", type=str, default="openai/whisper-large-v3",
         help="Whisper model to use as baseline.",
     )
     parser.add_argument(

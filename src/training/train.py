@@ -4,7 +4,7 @@ Fine-tune Whisper with QLoRA for Neplish (code-switched Nepali-English) ASR.
 This script:
   1. Loads the pre-built HuggingFace dataset (train/val/test).
   2. Prepares Whisper feature-extractor and tokenizer.
-  3. Loads whisper-medium in 4-bit (NF4) via BitsAndBytes.
+  3. Loads whisper-large-v3 in 4-bit (NF4) via BitsAndBytes.
   4. Applies LoRA via PEFT on top of the quantized model (= QLoRA).
   5. Trains with the HuggingFace Seq2SeqTrainer.
   6. Evaluates on validation set using WER.

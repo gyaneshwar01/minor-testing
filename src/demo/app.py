@@ -50,7 +50,7 @@ def load_finetuned():
         return _finetuned_model, _finetuned_processor
 
     model_dir = str(PROJECT_ROOT / "models" / "whisper-neplish" / "final")
-    base_model_name = "openai/whisper-medium"
+    base_model_name = "openai/whisper-large-v3"
     device = get_device()
 
     logger.info("Loading fine-tuned model from %s ...", model_dir)
@@ -77,7 +77,7 @@ def load_vanilla():
     if _vanilla_model is not None:
         return _vanilla_model, _vanilla_processor
 
-    model_name = "openai/whisper-medium"
+    model_name = "openai/whisper-large-v3"
     device = get_device()
 
     logger.info("Loading vanilla Whisper (%s) ...", model_name)
