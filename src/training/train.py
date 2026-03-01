@@ -308,7 +308,7 @@ def train(config: NeplishASRConfig | None = None, dataset_dir_override: str | No
         compute_metrics=partial(
             compute_metrics, tokenizer=tokenizer, metric_wer=metric_wer
         ),
-        tokenizer=processor.feature_extractor,
+        processing_class=processor.feature_extractor,
     )
 
     # ------------------------------------------------------------------
