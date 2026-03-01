@@ -5,8 +5,16 @@ Creates train / validation / test splits stratified by batch and
 code-switch presence, then saves them as a HuggingFace DatasetDict
 on disk for efficient loading during training.
 
+Optionally:
+  - Merges external pure-Nepali / English audio into the training split.
+  - Applies audio augmentation to expand the training set.
+
 Usage:
-    python -m src.data.prepare_dataset [--output_dir data/hf_dataset]
+    # Basic: just create splits (no augmentation)
+    python -m src.data.prepare_dataset
+
+    # Full pipeline: splits + external data + augmentation
+    python -m src.data.prepare_dataset --augment --add_external
 """
 
 import argparse
@@ -16,7 +24,7 @@ import re
 from pathlib import Path
 
 import pandas as pd
-from datasets import Audio, Dataset, DatasetDict
+from datasets import Audio, Dataset, DatasetDict, concatenate_datasets
 from sklearn.model_selection import train_test_split
 
 logger = logging.getLogger(__name__)
@@ -96,10 +104,73 @@ def build_hf_dataset(splits: dict[str, pd.DataFrame]) -> DatasetDict:
     return DatasetDict(ds_dict)
 
 
-def main(output_dir: str | None = None) -> None:
+def merge_external_data(
+    hf_ds: DatasetDict,
+    external_dir: str | None = None,
+    max_nepali: int = 500,
+    max_english: int = 300,
+    seed: int = 42,
+) -> DatasetDict:
+    """Merge external pure-Nepali and English audio into the training split.
+
+    External data is ONLY added to 'train'; validation and test remain
+    untouched so evaluation metrics stay comparable.
+    """
+    if external_dir is None:
+        external_dir = str(PROJECT_ROOT / "data" / "external")
+
+    ext_path = Path(external_dir)
+
+    # Download external data if not already cached
+    if not ext_path.exists():
+        logger.info("External data not found at %s -- downloading ...", external_dir)
+        from src.data.add_external_audio import download_external_data
+        download_external_data(
+            output_dir=external_dir,
+            max_nepali=max_nepali,
+            max_english=max_english,
+            seed=seed,
+        )
+
+    from datasets import load_from_disk
+    external = load_from_disk(external_dir)
+
+    extra_datasets = []
+
+    if "nepali" in external and len(external["nepali"]) > 0:
+        logger.info("  Adding %d pure Nepali samples to training set.", len(external["nepali"]))
+        extra_datasets.append(external["nepali"])
+
+    if "english" in external and len(external["english"]) > 0:
+        logger.info("  Adding %d pure English samples to training set.", len(external["english"]))
+        extra_datasets.append(external["english"])
+
+    if extra_datasets:
+        original_train = hf_ds["train"]
+        all_train = concatenate_datasets([original_train] + extra_datasets)
+        all_train = all_train.shuffle(seed=seed)
+        hf_ds["train"] = all_train
+        logger.info(
+            "  Training set after external merge: %d samples (was %d)",
+            len(all_train), len(original_train),
+        )
+
+    return hf_ds
+
+
+def main(
+    output_dir: str | None = None,
+    add_external: bool = False,
+    augment: bool = False,
+    num_augmented_copies: int = 2,
+    augmented_output_dir: str | None = None,
+    seed: int = 42,
+) -> None:
     """End-to-end dataset preparation."""
     if output_dir is None:
         output_dir = str(PROJECT_ROOT / "data" / "hf_dataset")
+    if augmented_output_dir is None:
+        augmented_output_dir = str(PROJECT_ROOT / "data" / "hf_dataset_augmented")
 
     cleaned_csv = DATASET_DIR / "cleaned_dataset.csv"
     if not cleaned_csv.exists():
@@ -113,7 +184,7 @@ def main(output_dir: str | None = None) -> None:
     logger.info("Total samples: %d", len(df))
 
     logger.info("Splitting dataset (80/10/10) ...")
-    splits = split_dataset(df)
+    splits = split_dataset(df, seed=seed)
 
     for name, sdf in splits.items():
         has_eng = sdf["sentence"].apply(lambda s: bool(re.search(r"[a-zA-Z]{2,}", str(s))))
@@ -125,12 +196,35 @@ def main(output_dir: str | None = None) -> None:
     logger.info("Building HuggingFace DatasetDict ...")
     hf_ds = build_hf_dataset(splits)
 
-    logger.info("Saving to %s ...", output_dir)
+    # --- Save base (non-augmented) dataset ---
+    logger.info("Saving base dataset to %s ...", output_dir)
     os.makedirs(output_dir, exist_ok=True)
     hf_ds.save_to_disk(output_dir)
-
-    print(f"\nDataset saved to {output_dir}")
+    print(f"\nBase dataset saved to {output_dir}")
     print(hf_ds)
+
+    # --- Optionally merge external pure-language data ---
+    if add_external:
+        logger.info("Merging external Nepali + English data ...")
+        hf_ds = merge_external_data(hf_ds, seed=seed)
+
+    # --- Optionally apply augmentation ---
+    if augment:
+        logger.info("Running audio augmentation (%d copies) ...", num_augmented_copies)
+        from src.data.augment import augment_dataset
+        hf_ds = augment_dataset(
+            hf_ds,
+            num_augmented_copies=num_augmented_copies,
+            seed=seed,
+        )
+
+        logger.info("Saving augmented dataset to %s ...", augmented_output_dir)
+        os.makedirs(augmented_output_dir, exist_ok=True)
+        hf_ds.save_to_disk(augmented_output_dir)
+        print(f"\nAugmented dataset saved to {augmented_output_dir}")
+        print(hf_ds)
+    else:
+        print("\nSkipping augmentation (use --augment to enable).")
 
 
 if __name__ == "__main__":
@@ -139,8 +233,36 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare HF dataset for Whisper fine-tuning.")
     parser.add_argument(
         "--output_dir", type=str, default=None,
-        help="Directory to save the HuggingFace DatasetDict.",
+        help="Directory to save the base HuggingFace DatasetDict.",
+    )
+    parser.add_argument(
+        "--augment", action="store_true",
+        help="Apply audio augmentation to the training split.",
+    )
+    parser.add_argument(
+        "--add_external", action="store_true",
+        help="Download and merge external Nepali + English audio into training.",
+    )
+    parser.add_argument(
+        "--num_augmented_copies", type=int, default=2,
+        help="Number of augmented copies per training sample (default: 2).",
+    )
+    parser.add_argument(
+        "--augmented_output_dir", type=str, default=None,
+        help="Directory to save the augmented dataset.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for reproducibility.",
     )
     args = parser.parse_args()
-    main(output_dir=args.output_dir)
+
+    main(
+        output_dir=args.output_dir,
+        add_external=args.add_external,
+        augment=args.augment,
+        num_augmented_copies=args.num_augmented_copies,
+        augmented_output_dir=args.augmented_output_dir,
+        seed=args.seed,
+    )
 

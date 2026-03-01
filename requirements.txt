@@ -36,3 +36,6 @@ ipykernel>=6.0.0
 numpy>=1.24.0
 tqdm>=4.65.0
 
+# External data (FLEURS download)
+# Already covered by `datasets` -- no extra deps needed
+

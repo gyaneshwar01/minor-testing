@@ -4,15 +4,13 @@ Fine-tune Whisper with QLoRA for Neplish (code-switched Nepali-English) ASR.
 This script:
   1. Loads the pre-built HuggingFace dataset (train/val/test).
   2. Prepares Whisper feature-extractor and tokenizer.
-  3. Loads whisper-medium in 4-bit (NF4) via BitsAndBytes.
+  3. Loads whisper-large-v3 in 4-bit (NF4) via BitsAndBytes.
   4. Applies LoRA via PEFT on top of the quantized model (= QLoRA).
   5. Trains with the HuggingFace Seq2SeqTrainer.
   6. Evaluates on validation set using WER.
 
-Usage (local):
+Usage (server):
     python -m src.training.train
-
-Usage (Colab): see notebooks/02_training.ipynb
 """
 
 import logging
@@ -223,8 +221,21 @@ def train(config: NeplishASRConfig | None = None) -> None:
     # ------------------------------------------------------------------
     # 4. Load and preprocess dataset
     # ------------------------------------------------------------------
-    logger.info("Loading dataset from %s", config.data.hf_dataset_dir)
-    dataset = load_from_disk(config.data.hf_dataset_dir)
+    # Use augmented dataset if available and configured
+    dataset_dir = config.data.hf_dataset_dir
+    if config.data.use_augmented:
+        augmented_dir = config.data.hf_augmented_dataset_dir
+        if Path(augmented_dir).exists():
+            dataset_dir = augmented_dir
+            logger.info("Using augmented dataset from %s", augmented_dir)
+        else:
+            logger.warning(
+                "Augmented dataset not found at %s, falling back to %s",
+                augmented_dir, dataset_dir,
+            )
+
+    logger.info("Loading dataset from %s", dataset_dir)
+    dataset = load_from_disk(dataset_dir)
 
     logger.info("Preprocessing dataset (extracting features + tokenising) ...")
     prep_fn = partial(
