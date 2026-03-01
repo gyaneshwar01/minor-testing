@@ -51,8 +51,8 @@ class LoRAConfig:
 class DataConfig:
     """Dataset paths and processing settings."""
 
-    hf_dataset_dir: str = str(PROJECT_ROOT / "data" / "hf_dataset")
-    hf_augmented_dataset_dir: str = str(PROJECT_ROOT / "data" / "hf_dataset_augmented")
+    hf_dataset_dir: str = str(PROJECT_ROOT / "hf_dataset")
+    hf_augmented_dataset_dir: str = str(PROJECT_ROOT / "hf_dataset_augmented")
     use_augmented: bool = True  # Set to True to train on augmented data
     max_audio_length_s: float = 30.0  # Whisper's max is 30s
     sampling_rate: int = 16_000

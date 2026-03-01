@@ -139,7 +139,7 @@ def compute_metrics(pred, tokenizer, metric_wer):
 # Main training loop
 # ---------------------------------------------------------------------------
 
-def train(config: NeplishASRConfig | None = None) -> None:
+def train(config: NeplishASRConfig | None = None, dataset_dir_override: str | None = None) -> None:
     """Run the full QLoRA training pipeline."""
     if config is None:
         config = NeplishASRConfig()
@@ -223,20 +223,24 @@ def train(config: NeplishASRConfig | None = None) -> None:
     # ------------------------------------------------------------------
     # 4. Load and preprocess dataset
     # ------------------------------------------------------------------
-    if config.data.use_augmented:
+    if dataset_dir_override is not None:
+        dataset_dir = dataset_dir_override
+        # resolve relative paths against project root
+        if not os.path.isabs(dataset_dir):
+            dataset_dir = str(Path(__file__).resolve().parents[2] / dataset_dir)
+        logger.info("Using dataset from CLI override: %s", dataset_dir)
+    elif config.data.use_augmented:
         dataset_dir = config.data.hf_augmented_dataset_dir
         logger.info("Using AUGMENTED dataset from %s", dataset_dir)
+        if not os.path.exists(dataset_dir):
+            dataset_dir = config.data.hf_dataset_dir
+            logger.warning(
+                "Augmented dataset not found. Falling back to original: %s",
+                dataset_dir,
+            )
     else:
         dataset_dir = config.data.hf_dataset_dir
         logger.info("Using original dataset from %s", dataset_dir)
-
-    if not os.path.exists(dataset_dir):
-        # Fall back to original dataset if augmented doesn't exist
-        dataset_dir = config.data.hf_dataset_dir
-        logger.warning(
-            "Augmented dataset not found. Falling back to original: %s",
-            dataset_dir,
-        )
 
     dataset = load_from_disk(dataset_dir)
 
@@ -326,5 +330,14 @@ def train(config: NeplishASRConfig | None = None) -> None:
 
 
 if __name__ == "__main__":
+    import argparse
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    train()
+    parser = argparse.ArgumentParser(description="Fine-tune Whisper with QLoRA.")
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default=None,
+        help="Override dataset directory (absolute or relative to project root).",
+    )
+    args = parser.parse_args()
+    train(dataset_dir_override=args.dataset_dir)
