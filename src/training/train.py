@@ -106,8 +106,8 @@ def preprocess_function(
         return_tensors="np",
     ).input_features[0]
 
-    # Tokenise the target text
-    labels = tokenizer(examples["sentence"]).input_ids
+    # Tokenise the target text (truncate to Whisper's max decoder length of 448)
+    labels = tokenizer(examples["sentence"]).input_ids[:448]
 
     return {
         "input_features": input_features,
