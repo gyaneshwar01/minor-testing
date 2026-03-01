@@ -41,7 +41,7 @@ class LoRAConfig:
     lora_alpha: int = 64
     lora_dropout: float = 0.05
     target_modules: list[str] = field(
-        default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]
+        default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj", "fc1", "fc2"]
     )
     bias: str = "none"
     task_type: str = "SEQ_2_SEQ_LM"

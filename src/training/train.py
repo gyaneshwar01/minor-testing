@@ -191,13 +191,12 @@ def train(config: NeplishASRConfig | None = None, dataset_dir_override: str | No
 
     # Whisper-specific: disable cache for gradient checkpointing compatibility
     model.config.use_cache = False
-    model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
 
-    # Generation config
+    # Generation config (transformers 5.x requires these on generation_config, not model.config)
     model.generation_config.language = config.model.language
     model.generation_config.task = config.model.task
     model.generation_config.forced_decoder_ids = None
+    model.generation_config.suppress_tokens = []
 
     # ------------------------------------------------------------------
     # 3. Prepare model for k-bit training and apply LoRA
@@ -289,6 +288,7 @@ def train(config: NeplishASRConfig | None = None, dataset_dir_override: str | No
         push_to_hub=config.training.push_to_hub,
         label_names=config.training.label_names,
         gradient_checkpointing=config.training.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         optim=config.training.optim,
         predict_with_generate=True,
         generation_max_length=225,
