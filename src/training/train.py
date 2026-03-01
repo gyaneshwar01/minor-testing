@@ -139,7 +139,7 @@ def compute_metrics(pred, tokenizer, metric_wer):
 # Main training loop
 # ---------------------------------------------------------------------------
 
-def train(config: NeplishASRConfig | None = None, dataset_dir_override: str | None = None) -> None:
+def train(config: NeplishASRConfig | None = None, dataset_dir_override: str | None = None, resume_from_checkpoint: str | None = None) -> None:
     """Run the full QLoRA training pipeline."""
     if config is None:
         config = NeplishASRConfig()
@@ -315,7 +315,7 @@ def train(config: NeplishASRConfig | None = None, dataset_dir_override: str | No
     # 6. Train
     # ------------------------------------------------------------------
     logger.info("Starting training ...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     # ------------------------------------------------------------------
     # 7. Save final model
@@ -339,5 +339,11 @@ if __name__ == "__main__":
         default=None,
         help="Override dataset directory (absolute or relative to project root).",
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a checkpoint directory to resume training from.",
+    )
     args = parser.parse_args()
-    train(dataset_dir_override=args.dataset_dir)
+    train(dataset_dir_override=args.dataset_dir, resume_from_checkpoint=args.resume_from_checkpoint)
