@@ -1,35 +1,40 @@
 """
 Data Augmentation Pipeline for Neplish ASR Dataset.
 
-Applies audio-level augmentations to the HuggingFace dataset to improve
-model robustness. Also oversamples pure-Nepali and code-switched (English)
-subsets to balance representation.
+Applies CONSERVATIVE audio-level augmentations to improve model robustness
+without distorting speech beyond recognition.
+
+Key design principles:
+  - Each augmented sample gets exactly ONE transform (no stacking)
+  - Tempo change uses librosa.effects.time_stretch (correct implementation)
+  - No time-shift / circular roll (breaks Whisper positional encoding)
+  - No pink noise (broken IIR filter — just use Gaussian)
+  - Gentle parameter ranges (model should still hear clear speech)
+  - All outputs validated (NaN, silence, duration checks)
+  - Code-switched oversampling is moderate (1 extra copy)
 
 Augmentations applied:
-  1. Additive noise injection (white noise, pink noise)
-  2. Speed perturbation (0.9x - 1.1x)
-  3. Pitch shifting (±2 semitones)
-  4. Volume perturbation (gain ±6 dB)
-  5. Time-domain shift (random roll)
-  6. Oversampling of pure-Nepali and code-switched subsets with
-     different augmentation combos
+  1. Gaussian noise injection (SNR 20-40 dB)
+  2. Tempo change via time_stretch (0.93x - 1.07x)
+  3. Pitch shifting (±1.5 semitones)
+  4. Volume perturbation (gain ±4 dB)
 
 Usage:
     python -m src.data.augment_dataset [--input_dir data/hf_dataset]
                                        [--output_dir data/hf_dataset_augmented]
-                                       [--augment_factor 2]
+                                       [--augment_factor 1]
 """
 
 import argparse
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from datasets import Audio, Dataset, DatasetDict, concatenate_datasets, load_from_disk
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 
 logger = logging.getLogger(__name__)
 
@@ -42,200 +47,179 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 @dataclass
 class AugmentationConfig:
-    """Settings for each augmentation type."""
+    """Conservative augmentation settings tuned for Whisper fine-tuning.
 
-    # Noise injection
+    Each augmented copy gets exactly ONE random transform.
+    Ranges are deliberately gentle so the model still hears clear speech.
+    """
+
+    # --- Noise injection ---
     noise_enabled: bool = True
-    white_noise_snr_range: tuple[float, float] = (15.0, 30.0)  # dB
-    pink_noise_snr_range: tuple[float, float] = (15.0, 30.0)   # dB
+    noise_snr_range: tuple[float, float] = (20.0, 40.0)  # dB — gentle
 
-    # Speed perturbation
+    # --- Tempo change (via librosa.effects.time_stretch) ---
     speed_enabled: bool = True
-    speed_range: tuple[float, float] = (0.9, 1.1)
+    speed_range: tuple[float, float] = (0.93, 1.07)  # tight range
 
-    # Pitch shifting
+    # --- Pitch shifting ---
     pitch_enabled: bool = True
-    pitch_semitone_range: tuple[float, float] = (-2.0, 2.0)
+    pitch_semitone_range: tuple[float, float] = (-1.5, 1.5)  # moderate
 
-    # Volume perturbation
+    # --- Volume perturbation ---
     volume_enabled: bool = True
-    volume_gain_db_range: tuple[float, float] = (-6.0, 6.0)
+    volume_gain_db_range: tuple[float, float] = (-4.0, 4.0)  # gentle
 
-    # Time shift
-    time_shift_enabled: bool = True
-    time_shift_max_fraction: float = 0.1  # max 10% of audio length
-
-    # Oversampling
-    oversample_pure_nepali: bool = True
+    # --- Oversampling ---
     oversample_code_switched: bool = True
-    nepali_augment_factor: int = 1   # extra copies of pure-Nepali samples
-    english_augment_factor: int = 2  # extra copies of code-switched samples
+    cs_extra_copies: int = 1  # just 1 extra copy for CS samples
 
-    # General
-    augment_factor: int = 2          # how many augmented copies per sample
+    # --- General ---
+    augment_factor: int = 1          # 1 augmented copy per sample
     seed: int = 42
     sampling_rate: int = 16_000
 
+    # --- Validation thresholds ---
+    min_audio_seconds: float = 0.5
+    max_audio_seconds: float = 30.0
+
 
 # ---------------------------------------------------------------------------
-# Noise generation utilities
+# Audio validation
 # ---------------------------------------------------------------------------
 
-def _generate_white_noise(length: int, rng: np.random.Generator) -> np.ndarray:
-    """Generate white (Gaussian) noise."""
-    return rng.standard_normal(length).astype(np.float32)
-
-
-def _generate_pink_noise(length: int, rng: np.random.Generator) -> np.ndarray:
-    """Generate pink (1/f) noise using the Voss-McCartney algorithm."""
-    # Simplified approach: filter white noise
-    white = rng.standard_normal(length).astype(np.float32)
-    # Apply a simple 1/f filter via cumulative sum + decay
-    b = [0.049922035, -0.095993537, 0.050612699, -0.004709510]
-    a = [1.0, -2.494956002, 2.017265875, -0.522189400]
-
-    # Use simple IIR filtering
-    from scipy.signal import lfilter
-    pink = lfilter(b, a, white).astype(np.float32)
-
-    # Normalise to unit variance
-    std = np.std(pink)
-    if std > 0:
-        pink = pink / std
-    return pink
-
-
-def _add_noise(
+def validate_audio(
     audio: np.ndarray,
-    noise: np.ndarray,
-    snr_db: float,
-) -> np.ndarray:
-    """Mix audio with noise at a given SNR (in dB)."""
-    audio_power = np.mean(audio ** 2)
-    if audio_power < 1e-10:
-        return audio
+    sr: int,
+    config: AugmentationConfig,
+) -> bool:
+    """Check if audio sample is valid for Whisper training."""
+    if audio is None or len(audio) == 0:
+        return False
 
-    noise_power = np.mean(noise ** 2)
-    if noise_power < 1e-10:
-        return audio
+    min_samples = int(config.min_audio_seconds * sr)
+    max_samples = int(config.max_audio_seconds * sr)
+    if len(audio) < min_samples or len(audio) > max_samples:
+        return False
 
-    target_noise_power = audio_power / (10 ** (snr_db / 10))
-    scale = np.sqrt(target_noise_power / noise_power)
-    return (audio + scale * noise).astype(np.float32)
+    # Reject silence (RMS too low)
+    rms = np.sqrt(np.mean(audio ** 2))
+    if rms < 1e-6:
+        return False
+
+    # Reject NaN / Inf
+    if not np.isfinite(audio).all():
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Individual augmentation functions
 # ---------------------------------------------------------------------------
 
-def add_white_noise(
+def add_gaussian_noise(
     audio: np.ndarray,
     rng: np.random.Generator,
-    snr_range: tuple[float, float] = (15.0, 30.0),
+    snr_range: tuple[float, float] = (20.0, 40.0),
 ) -> np.ndarray:
-    """Add white Gaussian noise at a random SNR."""
+    """Add Gaussian white noise at a random SNR."""
     snr_db = rng.uniform(*snr_range)
-    noise = _generate_white_noise(len(audio), rng)
-    return _add_noise(audio, noise, snr_db)
+    audio_power = np.mean(audio ** 2)
+    if audio_power < 1e-10:
+        return audio
+
+    noise = rng.standard_normal(len(audio)).astype(np.float32)
+    noise_power = np.mean(noise ** 2)
+    target_noise_power = audio_power / (10 ** (snr_db / 10))
+    scale = np.sqrt(target_noise_power / max(noise_power, 1e-10))
+
+    result = (audio + scale * noise).astype(np.float32)
+    return np.clip(result, -1.0, 1.0)
 
 
-def add_pink_noise(
-    audio: np.ndarray,
-    rng: np.random.Generator,
-    snr_range: tuple[float, float] = (15.0, 30.0),
-) -> np.ndarray:
-    """Add pink (1/f) noise at a random SNR."""
-    snr_db = rng.uniform(*snr_range)
-    noise = _generate_pink_noise(len(audio), rng)
-    # Ensure noise length matches audio
-    if len(noise) > len(audio):
-        noise = noise[: len(audio)]
-    elif len(noise) < len(audio):
-        noise = np.pad(noise, (0, len(audio) - len(noise)))
-    return _add_noise(audio, noise, snr_db)
-
-
-def speed_perturbation(
+def change_tempo(
     audio: np.ndarray,
     sr: int,
     rng: np.random.Generator,
-    speed_range: tuple[float, float] = (0.9, 1.1),
+    speed_range: tuple[float, float] = (0.93, 1.07),
 ) -> np.ndarray:
-    """Apply speed perturbation via resampling (changes tempo and pitch)."""
+    """Change tempo WITHOUT changing pitch using librosa.effects.time_stretch.
+
+    This is the correct way to do speed perturbation for ASR:
+    the words are spoken faster/slower but the pitch stays natural.
+
+    NOTE: The old implementation used librosa.resample twice which is a
+    no-op (resample down then back up just applies anti-aliasing filters).
+    time_stretch actually changes the duration of the audio.
+    """
     import librosa
 
-    speed_factor = rng.uniform(*speed_range)
-    # Resample to simulate speed change
-    augmented = librosa.resample(
-        audio,
-        orig_sr=sr,
-        target_sr=int(sr * speed_factor),
-    )
-    # Resample back to original SR to keep consistent sample rate
-    augmented = librosa.resample(
-        augmented,
-        orig_sr=int(sr * speed_factor),
-        target_sr=sr,
-    )
+    rate = rng.uniform(*speed_range)
+    # time_stretch: rate > 1 = faster (shorter audio), rate < 1 = slower
+    augmented = librosa.effects.time_stretch(y=audio, rate=rate)
+
+    # Trim to Whisper's 30s window if stretched longer
+    max_len = int(30.0 * sr)
+    if len(augmented) > max_len:
+        augmented = augmented[:max_len]
+
     return augmented.astype(np.float32)
 
 
-def pitch_shift(
+def shift_pitch(
     audio: np.ndarray,
     sr: int,
     rng: np.random.Generator,
-    semitone_range: tuple[float, float] = (-2.0, 2.0),
+    semitone_range: tuple[float, float] = (-1.5, 1.5),
 ) -> np.ndarray:
-    """Shift pitch by a random number of semitones."""
+    """Shift pitch by a small random amount."""
     import librosa
 
     n_steps = rng.uniform(*semitone_range)
-    augmented = librosa.effects.pitch_shift(
-        y=audio, sr=sr, n_steps=n_steps
-    )
-    return augmented.astype(np.float32)
+    # Skip negligible shifts
+    if abs(n_steps) < 0.1:
+        return audio
+
+    augmented = librosa.effects.pitch_shift(y=audio, sr=sr, n_steps=n_steps)
+    return np.clip(augmented, -1.0, 1.0).astype(np.float32)
 
 
-def volume_perturbation(
+def change_volume(
     audio: np.ndarray,
     rng: np.random.Generator,
-    gain_db_range: tuple[float, float] = (-6.0, 6.0),
+    gain_db_range: tuple[float, float] = (-4.0, 4.0),
 ) -> np.ndarray:
     """Apply random volume gain in dB."""
     gain_db = rng.uniform(*gain_db_range)
     gain_linear = 10 ** (gain_db / 20)
     augmented = audio * gain_linear
-
-    # Clip to prevent clipping
-    augmented = np.clip(augmented, -1.0, 1.0)
-    return augmented.astype(np.float32)
-
-
-def time_shift(
-    audio: np.ndarray,
-    rng: np.random.Generator,
-    max_fraction: float = 0.1,
-) -> np.ndarray:
-    """Randomly shift audio in time (circular roll)."""
-    max_shift = int(len(audio) * max_fraction)
-    if max_shift == 0:
-        return audio
-    shift = rng.integers(-max_shift, max_shift)
-    return np.roll(audio, shift).astype(np.float32)
+    return np.clip(augmented, -1.0, 1.0).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# Augmentation pipeline
+# Augmentation pipeline — exactly ONE transform per sample
 # ---------------------------------------------------------------------------
+
+# Registry: name -> config flag that enables it
+_AUGMENTATION_REGISTRY = {
+    "noise": "noise_enabled",
+    "tempo": "speed_enabled",
+    "pitch": "pitch_enabled",
+    "volume": "volume_enabled",
+}
+
 
 def augment_audio(
     audio: np.ndarray,
     sr: int,
     rng: np.random.Generator,
     config: AugmentationConfig,
-    augment_type: Optional[str] = None,
 ) -> np.ndarray:
-    """Apply a random combination of augmentations to an audio sample.
+    """Apply exactly ONE random augmentation to the audio.
+
+    Stacking multiple augmentations degrades audio quality and teaches
+    the model to predict from distorted inputs, hurting real-world
+    performance.  One clean transform per copy is sufficient.
 
     Parameters
     ----------
@@ -247,154 +231,105 @@ def augment_audio(
         Random number generator for reproducibility.
     config : AugmentationConfig
         Augmentation settings.
-    augment_type : str, optional
-        If specified, apply only this augmentation type. One of:
-        "white_noise", "pink_noise", "speed", "pitch", "volume", "time_shift",
-        "combo" (random combination of 2-3 augmentations).
-        If None, a random type is chosen.
 
     Returns
     -------
     np.ndarray
         Augmented audio waveform.
     """
-    available_augmentations = []
-    if config.noise_enabled:
-        available_augmentations.extend(["white_noise", "pink_noise"])
-    if config.speed_enabled:
-        available_augmentations.append("speed")
-    if config.pitch_enabled:
-        available_augmentations.append("pitch")
-    if config.volume_enabled:
-        available_augmentations.append("volume")
-    if config.time_shift_enabled:
-        available_augmentations.append("time_shift")
+    # Build list of enabled augmentations
+    available = [
+        name for name, flag in _AUGMENTATION_REGISTRY.items()
+        if getattr(config, flag, False)
+    ]
 
-    if not available_augmentations:
+    if not available:
         return audio
 
-    if augment_type is None:
-        # 50% chance of single augmentation, 50% chance of combo
-        # (combo requires at least 2 augmentation types available)
-        if len(available_augmentations) >= 2 and rng.random() < 0.5:
-            augment_type = "combo"
-        else:
-            augment_type = rng.choice(available_augmentations)
+    choice = rng.choice(available)
 
-    augmented = audio.copy()
-
-    if augment_type == "combo":
-        # Apply 2-3 random augmentations in sequence
-        max_combo = min(4, len(available_augmentations) + 1)
-        if max_combo <= 2:
-            n_augs = 2
-        else:
-            n_augs = rng.integers(2, max_combo)
-        n_augs = min(n_augs, len(available_augmentations))  # safety cap
-        chosen = rng.choice(available_augmentations, size=n_augs, replace=False)
-        for aug in chosen:
-            augmented = _apply_single_augmentation(augmented, sr, rng, config, aug)
+    if choice == "noise":
+        return add_gaussian_noise(audio, rng, config.noise_snr_range)
+    elif choice == "tempo":
+        return change_tempo(audio, sr, rng, config.speed_range)
+    elif choice == "pitch":
+        return shift_pitch(audio, sr, rng, config.pitch_semitone_range)
+    elif choice == "volume":
+        return change_volume(audio, rng, config.volume_gain_db_range)
     else:
-        augmented = _apply_single_augmentation(augmented, sr, rng, config, augment_type)
-
-    return augmented
-
-
-def _apply_single_augmentation(
-    audio: np.ndarray,
-    sr: int,
-    rng: np.random.Generator,
-    config: AugmentationConfig,
-    aug_type: str,
-) -> np.ndarray:
-    """Apply a single named augmentation."""
-    if aug_type == "white_noise":
-        return add_white_noise(audio, rng, config.white_noise_snr_range)
-    elif aug_type == "pink_noise":
-        return add_pink_noise(audio, rng, config.pink_noise_snr_range)
-    elif aug_type == "speed":
-        return speed_perturbation(audio, sr, rng, config.speed_range)
-    elif aug_type == "pitch":
-        return pitch_shift(audio, sr, rng, config.pitch_semitone_range)
-    elif aug_type == "volume":
-        return volume_perturbation(audio, rng, config.volume_gain_db_range)
-    elif aug_type == "time_shift":
-        return time_shift(audio, rng, config.time_shift_max_fraction)
-    else:
-        logger.warning("Unknown augmentation type: %s", aug_type)
         return audio
+
+
+# ---------------------------------------------------------------------------
+# Code-switch detection (stricter than a simple [a-zA-Z]{2,} regex)
+# ---------------------------------------------------------------------------
+
+# Common short Nepali words sometimes written in Latin script.
+# These must NOT trigger code-switch detection.
+_NEPALI_LATIN_FALSE_POSITIVES = {
+    "ma", "ta", "ko", "le", "ho", "ni", "ra", "na", "ke", "yo",
+    "ji", "la", "ha", "re", "ki", "ka", "ga", "ba", "da", "pa",
+    "ne", "se", "he", "ya", "sa", "de", "cha", "chu", "bha",
+    "hola", "gara", "garnu", "bhayo", "thiyo", "huncha",
+}
+
+
+def _is_code_switched(sentence: str) -> bool:
+    """Check if a sentence contains genuine English words.
+
+    More conservative than a simple ``[a-zA-Z]{2,}`` regex:
+      - Requires at least 3 Latin characters per word.
+      - Filters out common Nepali particles that may appear in Latin.
+    """
+    if not sentence or not isinstance(sentence, str):
+        return False
+    latin_words = re.findall(r"\b[a-zA-Z]{3,}\b", sentence)
+    for word in latin_words:
+        if word.lower() not in _NEPALI_LATIN_FALSE_POSITIVES:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Dataset-level augmentation
 # ---------------------------------------------------------------------------
 
-def _is_code_switched(sentence: str) -> bool:
-    """Check if a sentence contains English (Latin-script) words."""
-    return bool(re.search(r"[a-zA-Z]{2,}", str(sentence)))
-
-
-def augment_single_example(
-    example: dict,
-    rng: np.random.Generator,
-    config: AugmentationConfig,
-    augment_type: Optional[str] = None,
-) -> dict:
-    """Augment a single dataset example (audio + keep sentence unchanged)."""
-    audio_array = example["audio"]["array"]
-    sr = example["audio"]["sampling_rate"]
-
-    # Guard: skip augmentation for empty or near-silent audio
-    if audio_array is None or len(audio_array) == 0:
-        return {
-            "audio": {
-                "array": audio_array if audio_array is not None else np.array([], dtype=np.float32),
-                "sampling_rate": sr,
-                "path": example["audio"].get("path", ""),
-            },
-            "sentence": example["sentence"],
-        }
-
-    # Ensure float32
-    audio_array = audio_array.astype(np.float32)
-
-    augmented_audio = augment_audio(audio_array, sr, rng, config, augment_type)
-
-    return {
-        "audio": {
-            "array": augmented_audio,
-            "sampling_rate": sr,
-            "path": example["audio"].get("path", ""),
-        },
-        "sentence": example["sentence"],
-    }
-
-
-def _make_augment_fn(seed: int, config: AugmentationConfig, augment_type: Optional[str] = None):
-    """Return a stateless map function with its own RNG seeded per-index.
+def _make_augment_fn(seed: int, config: AugmentationConfig):
+    """Return a stateless map function with per-index RNG.
 
     Using the example index to seed ensures reproducibility *and* avoids
     sharing mutable RNG state across workers.
     """
     def _augment_map(example, idx):
-        # Per-example RNG so the function is stateless & safe for num_proc>1
         rng = np.random.default_rng(seed + idx)
-        audio_array = example["audio"]["array"]
-        sr = example["audio"]["sampling_rate"]
+        audio_data = example["audio"]
+        audio_array = audio_data["array"]
+        sr = audio_data["sampling_rate"]
 
         if audio_array is None or len(audio_array) == 0:
             return example
 
-        audio_array = audio_array.astype(np.float32)
+        audio_array = np.asarray(audio_array, dtype=np.float32)
+
+        # Skip if input audio is invalid
+        if not validate_audio(audio_array, sr, config):
+            return example
+
         try:
-            augmented = augment_audio(audio_array, sr, rng, config, augment_type)
-        except Exception:
-            augmented = audio_array
+            augmented = augment_audio(audio_array, sr, rng, config)
+        except Exception as e:
+            logger.debug("Augmentation failed for idx %d: %s", idx, e)
+            return example
+
+        # Validate output — reject if augmentation produced garbage
+        if not np.isfinite(augmented).all():
+            logger.debug("Augmentation produced non-finite at idx %d, keeping original.", idx)
+            return example
 
         example["audio"] = {
             "array": augmented,
             "sampling_rate": sr,
-            "path": example["audio"].get("path", ""),
+            "path": audio_data.get("path", ""),
         }
         return example
 
@@ -409,52 +344,39 @@ def augment_dataset(
 ) -> Dataset:
     """Create augmented copies of a dataset split.
 
-    Uses ``Dataset.map()`` so that augmented audio is written to
-    memory-mapped Arrow files instead of being held in RAM.
+    Strategy (conservative):
+      1. Create ``augment_factor`` copies of ALL training data
+         (each sample gets exactly 1 random transform).
+      2. Create ``cs_extra_copies`` additional copies of code-switched
+         samples only (to mildly boost CS representation).
+      3. Concatenate original + augmented, shuffle.
 
-    Steps:
-      1. Separate into pure-Nepali and code-switched subsets.
-      2. Apply augmentations with oversampling factors per subset.
-      3. Concatenate original + augmented data.
-
-    Parameters
-    ----------
-    dataset : Dataset
-        A single split (e.g. train) of the HF dataset.
-    config : AugmentationConfig
-        Augmentation settings.
-    split_name : str
-        Name of the split (for logging).
-    tmp_dir : str, optional
-        Directory for intermediate Arrow caches (defaults to system temp).
-
-    Returns
-    -------
-    Dataset
-        Augmented dataset (original + augmented copies).
+    Validation and test splits should NOT be passed here.
     """
     import gc
+    import shutil
     import tempfile
 
     if tmp_dir is None:
-        tmp_dir = os.path.join(tempfile.gettempdir(), "neplish_aug_cache")
+        tmp_dir = os.path.join(tempfile.gettempdir(), f"neplish_aug_{split_name}")
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
     os.makedirs(tmp_dir, exist_ok=True)
 
     sentences = dataset["sentence"]
-
-    # Identify subsets
     cs_indices = [i for i, s in enumerate(sentences) if _is_code_switched(s)]
     nepali_indices = [i for i, s in enumerate(sentences) if not _is_code_switched(s)]
 
     logger.info(
-        "[%s] Found %d pure-Nepali and %d code-switched samples",
-        split_name, len(nepali_indices), len(cs_indices),
+        "[%s] %d pure-Nepali, %d code-switched out of %d total",
+        split_name, len(nepali_indices), len(cs_indices), len(dataset),
     )
 
-    saved_paths: list[str] = []  # paths to saved augmented splits
+    saved_paths: list[str] = []
+    seed_offset = 0
 
-    def _map_and_save(subset: Dataset, label: str, copy_idx: int, seed_offset: int) -> None:
-        """Map augmentation over *subset*, save to disk, release memory."""
+    def _map_and_save(subset: Dataset, label: str, copy_idx: int) -> None:
+        nonlocal seed_offset
         aug_seed = config.seed + seed_offset
         aug_fn = _make_augment_fn(aug_seed, config)
 
@@ -462,6 +384,7 @@ def augment_dataset(
             aug_fn,
             with_indices=True,
             keep_in_memory=False,
+            num_proc=1,  # librosa is not always safe with multiprocessing
             desc=f"{label} copy {copy_idx + 1}",
         )
 
@@ -473,66 +396,45 @@ def augment_dataset(
             "[%s] %s augmented copy %d saved (%d samples)",
             split_name, label, copy_idx + 1, len(aug_ds),
         )
+        seed_offset += len(subset)
         del aug_ds
         gc.collect()
 
-    seed_offset = 0
-
-    # --- Augment pure-Nepali samples ---
-    nepali_factor = config.nepali_augment_factor
-    if config.oversample_pure_nepali and nepali_indices and nepali_factor > 0:
-        nepali_subset = dataset.select(nepali_indices)
+    # --- Step 1: General augmentation of all samples ---
+    if config.augment_factor > 0:
         logger.info(
-            "[%s] Creating %d augmented copies of %d pure-Nepali samples ...",
-            split_name, nepali_factor, len(nepali_subset),
+            "[%s] Creating %d general augmented copies of %d samples ...",
+            split_name, config.augment_factor, len(dataset),
         )
-        for copy_idx in range(nepali_factor):
-            _map_and_save(nepali_subset, "nepali", copy_idx, seed_offset)
-            seed_offset += len(nepali_subset)
-        del nepali_subset
-        gc.collect()
+        for copy_idx in range(config.augment_factor):
+            _map_and_save(dataset, "general", copy_idx)
 
-    # --- Augment code-switched (English) samples ---
-    english_factor = config.english_augment_factor
-    if config.oversample_code_switched and cs_indices and english_factor > 0:
+    # --- Step 2: Extra CS oversampling (moderate) ---
+    if config.oversample_code_switched and cs_indices and config.cs_extra_copies > 0:
         cs_subset = dataset.select(cs_indices)
         logger.info(
-            "[%s] Creating %d augmented copies of %d code-switched samples ...",
-            split_name, english_factor, len(cs_subset),
+            "[%s] Creating %d extra copies of %d code-switched samples ...",
+            split_name, config.cs_extra_copies, len(cs_subset),
         )
-        for copy_idx in range(english_factor):
-            _map_and_save(cs_subset, "codeswitched", copy_idx, seed_offset)
-            seed_offset += len(cs_subset)
+        for copy_idx in range(config.cs_extra_copies):
+            _map_and_save(cs_subset, "codeswitched", copy_idx)
         del cs_subset
         gc.collect()
 
-    # --- General augmentation of all samples ---
-    general_factor = config.augment_factor
-    if general_factor > 0:
-        logger.info(
-            "[%s] Creating %d general augmented copies of all %d samples ...",
-            split_name, general_factor, len(dataset),
-        )
-        for copy_idx in range(general_factor):
-            _map_and_save(dataset, "general", copy_idx, seed_offset)
-            seed_offset += len(dataset)
-        gc.collect()
-
-    # --- Concatenate original + all augmented from disk ---
+    # --- Step 3: Concatenate ---
     if saved_paths:
-        logger.info("[%s] Loading %d augmented splits from disk ...", split_name, len(saved_paths))
+        logger.info("[%s] Loading %d augmented splits ...", split_name, len(saved_paths))
         augmented_parts = [load_from_disk(p) for p in saved_paths]
         final_dataset = concatenate_datasets([dataset] + augmented_parts)
         final_dataset = final_dataset.shuffle(seed=config.seed)
+
         logger.info(
-            "[%s] Final dataset: %d samples (original: %d, augmented: %d)",
+            "[%s] Final: %d samples (original %d + augmented %d)",
             split_name, len(final_dataset), len(dataset),
             len(final_dataset) - len(dataset),
         )
-        # Cleanup temp files
-        import shutil
-        for p in saved_paths:
-            shutil.rmtree(p, ignore_errors=True)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         del augmented_parts
         gc.collect()
     else:
@@ -613,9 +515,8 @@ def augment_hf_dataset(
 def main(
     input_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
-    augment_factor: int = 2,
-    nepali_factor: int = 1,
-    english_factor: int = 2,
+    augment_factor: int = 1,
+    cs_extra_copies: int = 1,
 ) -> None:
     """Run the augmentation pipeline from the command line."""
     if input_dir is None:
@@ -625,19 +526,16 @@ def main(
 
     config = AugmentationConfig(
         augment_factor=augment_factor,
-        nepali_augment_factor=nepali_factor,
-        english_augment_factor=english_factor,
+        cs_extra_copies=cs_extra_copies,
     )
 
     logger.info("Augmentation config:")
-    logger.info("  General augment factor : %d", config.augment_factor)
-    logger.info("  Pure-Nepali factor     : %d", config.nepali_augment_factor)
-    logger.info("  Code-switched factor   : %d", config.english_augment_factor)
-    logger.info("  Noise enabled          : %s", config.noise_enabled)
-    logger.info("  Speed enabled          : %s", config.speed_enabled)
-    logger.info("  Pitch enabled          : %s", config.pitch_enabled)
-    logger.info("  Volume enabled         : %s", config.volume_enabled)
-    logger.info("  Time-shift enabled     : %s", config.time_shift_enabled)
+    logger.info("  General augment factor : %d (each gets 1 random transform)", config.augment_factor)
+    logger.info("  CS extra copies        : %d", config.cs_extra_copies)
+    logger.info("  Noise SNR range        : %s dB", config.noise_snr_range)
+    logger.info("  Tempo range            : %s", config.speed_range)
+    logger.info("  Pitch range            : %s semitones", config.pitch_semitone_range)
+    logger.info("  Volume range           : %s dB", config.volume_gain_db_range)
 
     augment_hf_dataset(input_dir, output_dir, config)
 
@@ -657,16 +555,12 @@ if __name__ == "__main__":
         help="Path to save the augmented HuggingFace DatasetDict.",
     )
     parser.add_argument(
-        "--augment_factor", type=int, default=2,
-        help="Number of augmented copies of each sample (general). Default: 2.",
+        "--augment_factor", type=int, default=1,
+        help="Augmented copies per sample (each gets 1 random transform). Default: 1.",
     )
     parser.add_argument(
-        "--nepali_factor", type=int, default=1,
-        help="Extra augmented copies for pure-Nepali samples. Default: 1.",
-    )
-    parser.add_argument(
-        "--english_factor", type=int, default=2,
-        help="Extra augmented copies for code-switched samples. Default: 2.",
+        "--cs_extra_copies", type=int, default=1,
+        help="Extra augmented copies for code-switched samples. Default: 1.",
     )
     args = parser.parse_args()
 
@@ -674,6 +568,5 @@ if __name__ == "__main__":
         input_dir=args.input_dir,
         output_dir=args.output_dir,
         augment_factor=args.augment_factor,
-        nepali_factor=args.nepali_factor,
-        english_factor=args.english_factor,
+        cs_extra_copies=args.cs_extra_copies,
     )
